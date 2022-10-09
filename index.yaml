@@ -1,0 +1,35 @@
+apiVersion: v1
+entries:
+  k8s-log-ingestion:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2022-10-09T19:59:14.618285439Z"
+    dependencies:
+    - alias: elastic-phenix-operator
+      condition: elastic-phenix-operator.enabled
+      name: raw
+      repository: https://charts.helm.sh/incubator/
+      version: 0.2.5
+    - alias: fluentd-elasticsearch
+      condition: fluentd-elasticsearch.enabled
+      name: generic-helm-chart
+      repository: https://dimensie10.github.io/generic-helm-chart
+      version: 2.4.0
+    - alias: fluentd-k8s
+      condition: fluentd-k8s.enabled
+      name: generic-helm-chart
+      repository: https://dimensie10.github.io/generic-helm-chart
+      version: 2.4.0
+    - alias: kibana-sidecar
+      condition: kibana-sidecar.enabled
+      name: generic-helm-chart
+      repository: https://dimensie10.github.io/generic-helm-chart
+      version: 2.4.0
+    description: A Helm chart for deploying a k8s log ingestion system on Kubernetes
+    digest: 443107e263065cd6472597a3b82e90a012240944fdadd573f8ace3cf39924286
+    name: k8s-log-ingestion
+    type: application
+    urls:
+    - https://github.com/dimensie10/k8s-log-ingestion/releases/download/k8s-log-ingestion-1.0.0/k8s-log-ingestion-1.0.0.tgz
+    version: 1.0.0
+generated: "2022-10-09T19:59:14.164270873Z"
