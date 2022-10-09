@@ -1,0 +1,1329 @@
+fluentd-k8s:
+  enabled: true
+
+  fullnameOverride: fluentd-k8s
+  serviceNameOverride: fluentd-k8s
+  containerNameOverride: fluentd
+  configmapNameOverride: fluentd-k8s
+
+  kind: DaemonSet
+
+  image:
+    repository: fluent/fluentd-kubernetes-daemonset
+    tag: "v1.14.5-debian-elasticsearch7-amd64-1.1"
+
+  updateStrategy:
+    type: RollingUpdate
+
+  service:
+    enabled: false
+
+  livenessProbe:
+    enabled: false
+
+  readinessProbe:
+    enabled: false
+
+  resources:
+    limits:
+      cpu: 100m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+  extraVolumes:
+    - name: varlog
+      hostPath:
+        path: /var/log
+    - name: varlibdockercontainers
+      hostPath:
+        path: /var/lib/docker/containers
+    # It is needed to copy systemd library to decompress journals
+    - name: libsystemddir
+      hostPath:
+        path: /usr/lib64
+    - emptyDir: {}
+      name: data
+
+  extraVolumeMounts:
+    - name: varlog
+      mountPath: /var/log
+    - name: varlibdockercontainers
+      mountPath: /var/lib/docker/containers
+      readOnly: true
+    - name: libsystemddir
+      mountPath: /usr/lib64
+      readOnly: true
+    - mountPath: /data
+      name: data
+
+  env:
+    open:
+      FLUENTD_ARGS: "--no-supervisor -v"
+      INCLUDE_TIMESTAMP: "false"
+      SOURCE_CONTAINERS_REFRESH_INTERVAL: 10s
+      SOURCE_CONTAINERS_POS_FILE: "/var/log/fluentd-pos/containers.log.pos"
+      FILTERS_ADD_TO_TAG_FIELD: "${stream=record.dig(\"stream\"); record.dig(\"kubernetes\", \"annotations\", \"fluentd/\"+stream+\"-log_type\")}"
+      OUTPUT_FINAL_TAG_REWRITE_TAG: "$1"
+      OUTPUT_COPY_MODE: no_copy
+      OUTPUT_FORWARD_HEARTBEAT_TYPE: tcp
+      OUTPUT_FORWARD_SEND_TIMEOUT: 60s
+      OUTPUT_FORWARD_RECOVER_WAIT: 10s
+      OUTPUT_FORWARD_HARD_TIMEOUT: 60s
+      OUTPUT_FORWARD_SERVER_NAME: fluentd-elasticsearch
+      OUTPUT_FORWARD_SERVER_HOST: fluentd-elasticsearch
+      OUTPUT_FORWARD_SERVER_PORT: 24224
+      OUTPUT_FORWARD_BUFFER_FLUSH_INTERVAL: 2s
+      OUTPUT_FORWARD_BUFFER_CHUNK_LIMIT_SIZE: 100MB
+      OUTPUT_FORWARD_BUFFER_FLUSH_THREAD_COUNT: 10
+      OUTPUT_FORWARD_BUFFER_RETRY_FOREVER: true
+      OUTPUT_FORWARD_BUFFER_PATH: "/data/forward-buffers/buffer.*"
+      OUTPUT_FORWARD_BUFFER_TOTAL_LIMIT_SIZE: 50GB
+      OUTPUT_FORWARD_BUFFER_COMPRESS: gzip
+      OUTPUT_FORWARD_BUFFER_FLUSH_MODE: interval
+      OUTPUT_FORWARD_BUFFER_RETRY_TYPE: exponential_backoff
+      OUTPUT_FORWARD_BUFFER_RETRY_MAX_INTERVAL: 30
+      OUTPUT_FORWARD_BUFFER_OVERFLOW_ACTION: block
+      OUTPUT_FILE_ARGS: "ignore_if_prev_successes"
+      OUTPUT_FILE_PATH: "/data/logs"
+      OUTPUT_FILE_APPEND: true
+      OUTPUT_FILE_ADD_PATH_SUFFIX: true
+      OUTPUT_FILE_PATH_SUFFIX: ".log.gz"
+      OUTPUT_FILE_COMPRESS: gzip
+      OUTPUT_FILE_INCLUDE_TAG_KEY: true
+      OUTPUT_FILE_TAG_KEY: "@fluentd_tag"
+      OUTPUT_FILE_BUFFER_FLUSH_INTERVAL: 10s
+      OUTPUT_FILE_BUFFER_CHUNK_LIMIT_SIZE: 100MB
+      OUTPUT_FILE_BUFFER_FLUSH_THREAD_COUNT: 2
+      OUTPUT_FILE_BUFFER_RETRY_FOREVER: true
+      OUTPUT_FILE_BUFFER_PATH: "/data/file-buffers/buffer.*"
+      OUTPUT_FILE_BUFFER_TOTAL_LIMIT_SIZE: 50GB
+      OUTPUT_FILE_BUFFER_COMPRESS: gzip
+      OUTPUT_FILE_BUFFER_FLUSH_MODE: interval
+      OUTPUT_FILE_BUFFER_RETRY_TYPE: exponential_backoff
+      OUTPUT_FILE_BUFFER_RETRY_MAX_INTERVAL: 30
+      OUTPUT_FILE_BUFFER_OVERFLOW_ACTION: block
+
+  configmaps:
+    fluentd-k8s:
+      /fluentd/etc:
+        fluent.conf:
+          contents: |-
+            <system>
+              <log>
+                format json
+              </log>
+            </system>
+            <label @FLUENT_LOG>
+              <match fluent.*>
+                @type stdout
+              </match>
+            </label>
+            <source>
+              @type tail
+              @id source_tail.containers
+              path /var/log/containers/*.log
+              pos_file "#{ENV['SOURCE_CONTAINERS_POS_FILE']}"
+              tag kubernetes.*
+              read_from_head true
+              refresh_interval "#{ENV['SOURCE_CONTAINERS_REFRESH_INTERVAL']}"
+              path_key log_file_path
+              <parse>
+                @type multi_format
+                <pattern>
+                  format json
+                  time_key time
+                  time_format %Y-%m-%dT%H:%M:%S.%NZ
+                </pattern>
+                <pattern>
+                  format /^(?<time>.+) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$/
+                  time_format %Y-%m-%dT%H:%M:%S.%N%:z
+                </pattern>
+              </parse>
+              @label @containers_input
+            </source>
+            <label @containers_input>
+              <filter kubernetes.**>
+                @id filter_concat
+                @type concat
+                key log
+                multiline_start_regexp /^\d{4}-\d{1,2}-\d{1,2} \d{2}:\d{2}:\d{2},\d{3} - \[[^\s]+\] - from [^\s]+ in [^\s]+\s*$/
+                multiline_end_regexp /^\s*$/
+                separator "\n"
+                flush_interval 2
+              </filter>
+              <filter kubernetes.**>
+                @id filter_kubernetes_metadata
+                @type kubernetes_metadata
+                annotation_match [ "^fluentd" ]
+              </filter>
+              <filter kubernetes.**>
+                @type record_transformer
+                @id filter_kubernetes_metadata.fluentd.fields
+                enable_ruby
+                <record>
+                  docker_container_id ${record.dig("docker", "container_id")}
+                  kubernetes_container_name ${record.dig("kubernetes", "container_name")}
+                  kubernetes_namespace_name ${record.dig("kubernetes", "namespace_name")}
+                  kubernetes_pod_name ${record.dig("kubernetes", "pod_name")}
+                  kubernetes_container_image ${record.dig("kubernetes", "container_image")}
+                  kubernetes_container_image_id ${record.dig("kubernetes", "container_image_id")}
+                  kubernetes_pod_id ${record.dig("kubernetes", "pod_id")}
+                  kubernetes_pod_ip ${record.dig("kubernetes", "pod_ip")}
+                  kubernetes_host ${record.dig("kubernetes", "host")}
+                  fluentd_format ${stream=record.dig("stream"); record.dig("kubernetes", "annotations", "fluentd/"+stream+"-format") || record.dig("kubernetes", "namespace_annotations", "fluentd/"+stream+"-format") || ("unknown")}
+                  fluentd_exclude ${stream=record.dig("stream"); ((record.dig("kubernetes", "annotations", "fluentd/"+stream+"-exclude")=="true") || (record.dig("kubernetes", "namespace_annotations", "fluentd/"+stream+"-exclude")=="true") || ((record.dig("kubernetes", "annotations", "fluentd/"+stream+"-format") || record.dig("kubernetes", "namespace_annotations", "fluentd/"+stream+"-format") || ("unknown")) == "unknown")) ? "true" : "false"}
+                  group ${record.dig("kubernetes", "annotations", "fluentd/group")}
+                  log_type ${stream=record.dig("stream"); record.dig("kubernetes", "annotations", "fluentd/"+stream+"-log_type")}
+                  add_to_tag "#{ENV['FILTERS_ADD_TO_TAG_FIELD']}"
+                </record>
+                remove_keys docker,kubernetes
+              </filter>
+              <filter kubernetes.**>
+                @type grep
+                @id filter_grep.fluentd_exclude
+                <regexp>
+                  key fluentd_exclude
+                  pattern /^false$/
+                </regexp>
+              </filter>
+              <match kubernetes.**>
+                @type rewrite_tag_filter
+                @id output_rewrite_tag_filter.fluentd_format
+                <rule>
+                  key fluentd_format
+                  pattern /^json$/
+                  tag json.${tag}
+                </rule>
+                <rule>
+                  key fluentd_format
+                  pattern /^scala-play-multiline$/
+                  tag scala_play_multiline.${tag}
+                </rule>
+                <rule>
+                  key fluentd_format
+                  pattern /^apache2$/
+                  tag apache2.${tag}
+                </rule>
+                <rule>
+                  key fluentd_format
+                  pattern /^apache_error$/
+                  tag apache_error.${tag}
+                </rule>
+                <rule>
+                  key fluentd_format
+                  pattern /^nginx$/
+                  tag nginx.${tag}
+                </rule>
+                <rule>
+                  key fluentd_format
+                  pattern /^ingress-nginx$/
+                  tag ingress-nginx.${tag}
+                </rule>
+                @label @containers_parse
+              </match>
+            </label>
+            <label @containers_parse>
+              <filter json.**>
+                @id filter_parser.json
+                @type parser
+                key_name log
+                reserve_time true
+                reserve_data true
+                remove_key_name_field true
+                <parse>
+                  @type json
+                </parse>
+              </filter>
+              <filter scala_play_multiline.**>
+                @id filter_parser.scala_play_multiline
+                @type parser
+                key_name log
+                reserve_time true
+                reserve_data true
+                remove_key_name_field true
+                <parse>
+                  @type multiline
+                  format_firstline /\d{4}-\d{1,2}-\d{1,2} \d{2}:\d{2}:\d{2},\d{3} - \[/
+                    format1 /(?<timestamp>[^ ]+ [^ ]+) - \[(?<level>[^\s]+)\] - from (?<from>[^\s]+) in (?<in>[^\s]+)\s*(?<message>[\s\S]*)/
+                </parse>
+              </filter>
+              <filter apache2.**>
+                @id filter_parser.apache2
+                @type parser
+                key_name log
+                reserve_time true
+                reserve_data true
+                remove_key_name_field true
+                <parse>
+                  @type apache2
+                </parse>
+              </filter>
+              <filter apache_error.**>
+                @id filter_parser.apache_error
+                @type parser
+                key_name log
+                reserve_time true
+                reserve_data true
+                remove_key_name_field true
+                <parse>
+                  @type apache_error
+                </parse>
+              </filter>
+              <filter nginx.**>
+                @id filter_parser.nginx
+                @type parser
+                key_name log
+                reserve_time true
+                reserve_data true
+                remove_key_name_field true
+                <parse>
+                  @type nginx
+                </parse>
+              </filter>
+              <filter ingress-nginx.**>
+                @id filter_parser.ingress-nginx
+                @type parser
+                key_name log
+                reserve_time true
+                reserve_data true
+                remove_key_name_field true
+                <parse>
+                  @type regexp
+                  time_key time_local
+                  keep_time_key true
+                  time_format %d/%b/%Y:%H:%M:%S %z
+                  expression /^(?<remote_addr>[^ ]*) (?<host>[^ ]*) (?<remote_user>[^ ]*) \[(?<time_local>[^\]]*)\] "(?<request_method>\S+)(?: +(?<request_path>[^\"]*?)(?: +(?<request_http_version>\S*))?)?" (?<status>[^ ]*) (?<body_bytes_sent>[^ ]*)(?: "(?<http_referer>[^\"]*)" "(?<http_user_agent>[^\"]*)" (?<request_length>[^ ]*) (?<request_time>[^ ]*) \[(?<proxy_upstream_name>[^\]]*)\] \[(?<proxy_alternative_upstream_name>[^\]]*)\] (?<upstream_addr>[^ ]*) (?<upstream_response_length>[^ ]*) (?<upstream_response_time>[^ ]*) (?<upstream_status>[^ ]*) (?<req_id>[^ ]*))?/
+                </parse>
+              </filter>
+              <match **>
+                @type rewrite_tag_filter
+                <rule>
+                  key "add_to_tag"
+                  pattern (.+)
+                  tag "#{ENV['OUTPUT_FINAL_TAG_REWRITE_TAG']}"
+                </rule>
+                @label @containers_output
+              </match>
+            </label>
+            <label @containers_output>
+              <filter **>
+                @type record_transformer
+                @id filter_kubernetes_metadata.fluentd.remove_fields
+                enable_ruby
+                remove_keys fluentd_format,fluentd_exclude,add_to_tag
+              </filter>
+              <match **>
+                @type copy
+                copy_mode "#{ENV['OUTPUT_COPY_MODE']}"
+                <store>
+                  type forward
+                  heartbeat_type "#{ENV['OUTPUT_FORWARD_HEARTBEAT_TYPE']}"
+                  send_timeout "#{ENV['OUTPUT_FORWARD_SEND_TIMEOUT']}"
+                  recover_wait "#{ENV['OUTPUT_FORWARD_RECOVER_WAIT']}"
+                  hard_timeout "#{ENV['OUTPUT_FORWARD_HARD_TIMEOUT']}"
+                  <server>
+                    name "#{ENV['OUTPUT_FORWARD_SERVER_NAME']}"
+                    host "#{ENV['OUTPUT_FORWARD_SERVER_HOST']}"
+                    port "#{ENV['OUTPUT_FORWARD_SERVER_PORT']}"
+                  </server>
+                  <buffer>
+                    @type file
+                    flush_interval "#{ENV['OUTPUT_FORWARD_BUFFER_FLUSH_INTERVAL']}"
+                    chunk_limit_size "#{ENV['OUTPUT_FORWARD_BUFFER_CHUNK_LIMIT_SIZE']}"
+                    flush_thread_count "#{ENV['OUTPUT_FORWARD_BUFFER_FLUSH_THREAD_COUNT']}"
+                    retry_forever "#{ENV['OUTPUT_FORWARD_BUFFER_RETRY_FOREVER']}"
+                    path "#{ENV['OUTPUT_FORWARD_BUFFER_PATH']}"
+                    total_limit_size "#{ENV['OUTPUT_FORWARD_BUFFER_TOTAL_LIMIT_SIZE']}"
+                    compress "#{ENV['OUTPUT_FORWARD_BUFFER_COMPRESS']}"
+                    flush_mode "#{ENV['OUTPUT_FORWARD_BUFFER_FLUSH_MODE']}"
+                    retry_type "#{ENV['OUTPUT_FORWARD_BUFFER_RETRY_TYPE']}"
+                    retry_max_interval "#{ENV['OUTPUT_FORWARD_BUFFER_RETRY_MAX_INTERVAL']}"
+                    overflow_action "#{ENV['OUTPUT_FORWARD_BUFFER_OVERFLOW_ACTION']}"
+                  </buffer>
+                </store>
+                <store"#{ENV['OUTPUT_FILE_ARGS'].nil? || ENV['OUTPUT_FILE_ARGS'].empty? ? "" : " " + ENV['OUTPUT_FILE_ARGS']}">
+                  @type file
+                  path "#{ENV['OUTPUT_FILE_PATH']}"
+                  append "#{ENV['OUTPUT_FILE_APPEND']}"
+                  add_path_suffix "#{ENV['OUTPUT_FILE_ADD_PATH_SUFFIX']}"
+                  path_suffix "#{ENV['OUTPUT_FILE_PATH_SUFFIX']}"
+                  compress "#{ENV['OUTPUT_FILE_COMPRESS']}"
+                  include_tag_key "#{ENV['OUTPUT_FILE_INCLUDE_TAG_KEY']}"
+                  tag_key "#{ENV['OUTPUT_FILE_TAG_KEY']}"
+                  <format>
+                    @type json
+                  </format>
+                  <buffer>
+                    @type file
+                    flush_interval "#{ENV['OUTPUT_FILE_BUFFER_FLUSH_INTERVAL']}"
+                    chunk_limit_size "#{ENV['OUTPUT_FILE_BUFFER_CHUNK_LIMIT_SIZE']}"
+                    flush_thread_count "#{ENV['OUTPUT_FILE_BUFFER_FLUSH_THREAD_COUNT']}"
+                    retry_forever "#{ENV['OUTPUT_FILE_BUFFER_RETRY_FOREVER']}"
+                    path "#{ENV['OUTPUT_FILE_BUFFER_PATH']}"
+                    total_limit_size "#{ENV['OUTPUT_FILE_BUFFER_TOTAL_LIMIT_SIZE']}"
+                    compress "#{ENV['OUTPUT_FILE_BUFFER_COMPRESS']}"
+                    flush_mode "#{ENV['OUTPUT_FILE_BUFFER_FLUSH_MODE']}"
+                    retry_type "#{ENV['OUTPUT_FILE_BUFFER_RETRY_TYPE']}"
+                    retry_max_interval "#{ENV['OUTPUT_FILE_BUFFER_RETRY_MAX_INTERVAL']}"
+                    overflow_action "#{ENV['OUTPUT_FILE_BUFFER_OVERFLOW_ACTION']}"
+                  </buffer>
+                </store>
+              </match>
+            </label>
+
+  serviceAccount:
+    create: true
+
+  rbac:
+    clusterRole:
+      create: true
+      spec:
+        rules: 
+          - apiGroups:
+              - ""
+            resources:
+              - namespaces
+              - pods
+            verbs:
+              - get
+              - watch
+              - list
+    clusterRoleBinding:
+      create: true
+      spec:
+        subjects:
+          - kind: ServiceAccount
+            name: fluentd-k8s
+            namespace: k8s-log-ingestion
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: fluentd-k8s
+
+fluentd-elasticsearch:
+  enabled: true
+
+  fullnameOverride: fluentd-elasticsearch
+  serviceNameOverride: fluentd-elasticsearch
+  containerNameOverride: fluentd
+  configmapNameOverride: fluentd-elasticsearch
+
+  kind: StatefulSet
+
+  image:
+    repository: fluent/fluentd-kubernetes-daemonset
+    tag: "v1.14.5-debian-elasticsearch7-amd64-1.1"
+
+  updateStrategy:
+    type: RollingUpdate
+
+  port: 24224
+  service:
+    ports:
+      - port: 24224
+        name: transport
+
+  livenessProbe:
+    enabled: false
+
+  readinessProbe:
+    enabled: false
+
+  resources:
+    limits:
+      cpu: 100m
+      memory: 400Mi
+    requests:
+      cpu: 100m
+      memory: 400Mi
+
+  volumeClaimTemplates:
+    - name: fluentd-elasticsearch-logs
+      spec:
+        accessModes:
+          - "ReadWriteOnce"
+        resources:
+          requests:
+            storage: "50Gi"
+        storageClassName: gp2
+
+  extraVolumeMounts:
+    - name: fluentd-elasticsearch-logs
+      mountPath: /data
+
+  env:
+    open:
+      FLUENTD_ARGS: "--no-supervisor -v"
+      SOURCE_PORT: 24224
+      SOURCE_BIND: "0.0.0.0"
+      OUTPUT_COPY_MODE: no_copy
+      OUTPUT_ELASTICSEARCH_HOST: notdefined
+      OUTPUT_ELASTICSEARCH_USER: notdefined
+      OUTPUT_ELASTICSEARCH_PORT: 443
+      OUTPUT_ELASTICSEARCH_SCHEME: https
+      OUTPUT_ELASTICSEARCH_SUPPRESS_TYPE_NAME: true
+      OUTPUT_ELASTICSEARCH_INCLUDE_TAG_KEY: true
+      OUTPUT_ELASTICSEARCH_TAG_KEY: "@fluentd_tag"
+      OUTPUT_ELASTICSEARCH_LOGSTASH_FORMAT: true
+      OUTPUT_ELASTICSEARCH_LOGSTASH_PREFIX: "logstash-"
+      OUTPUT_ELASTICSEARCH_LOGSTASH_DATEFORMAT: "%Y-%m-%d"
+      OUTPUT_ELASTICSEARCH_LOGSTASH_PREFIX_SEPARATOR: "_"
+      OUTPUT_ELASTICSEARCH_REQUEST_TIMEOUT: 60
+      OUTPUT_ELASTICSEARCH_RELOAD_CONNECTIONS: false
+      OUTPUT_ELASTICSEARCH_RECONNECT_ON_ERROR: true
+      OUTPUT_ELASTICSEARCH_RELOAD_ON_FAILURE: false
+      OUTPUT_ELASTICSEARCH_LOG_400_REASON: true
+      OUTPUT_ELASTICSEARCH_SSL_VERIFY: true
+      OUTPUT_ELASTICSEARCH_SSL_VERSION: TLSv1_2
+      OUTPUT_ELASTICSEARCH_TYPE_NAME: _doc
+      OUTPUT_ELASTICSEARCH_LOG_LEVEL: info
+      OUTPUT_ELASTICSEARCH_SNIFFER_CLASS_NAME: "Fluent::Plugin::ElasticsearchSimpleSniffer"
+      OUTPUT_ELASTICSEARCH_WITH_TRANSPORTER_LOG: "false"
+      OUTPUT_ELASTICSEARCH_INCLUDE_INDEX_IN_URL: "false"
+      OUTPUT_ELASTICSEARCH_BUFFER_FLUSH_INTERVAL: 10s
+      OUTPUT_ELASTICSEARCH_BUFFER_CHUNK_LIMIT_SIZE: 100MB
+      OUTPUT_ELASTICSEARCH_BUFFER_FLUSH_THREAD_COUNT: 2
+      OUTPUT_ELASTICSEARCH_BUFFER_RETRY_FOREVER: "false"
+      OUTPUT_ELASTICSEARCH_BUFFER_PATH: "/data/es-buffers/buffer.*"
+      OUTPUT_ELASTICSEARCH_BUFFER_TOTAL_LIMIT_SIZE: 50GB
+      OUTPUT_ELASTICSEARCH_BUFFER_COMPRESS: gzip
+      OUTPUT_ELASTICSEARCH_BUFFER_FLUSH_MODE: interval
+      OUTPUT_ELASTICSEARCH_BUFFER_RETRY_TYPE: exponential_backoff
+      OUTPUT_ELASTICSEARCH_BUFFER_RETRY_MAX_INTERVAL: 30
+      OUTPUT_ELASTICSEARCH_BUFFER_OVERFLOW_ACTION: block
+      OUTPUT_FILE_ARGS: "ignore_if_prev_successes"
+      OUTPUT_FILE_PATH: "/data/logs"
+      OUTPUT_FILE_APPEND: true
+      OUTPUT_FILE_ADD_PATH_SUFFIX: true
+      OUTPUT_FILE_PATH_SUFFIX: ".log.gz"
+      OUTPUT_FILE_COMPRESS: gzip
+      OUTPUT_FILE_INCLUDE_TAG_KEY: true
+      OUTPUT_FILE_TAG_KEY: "@fluentd_tag"
+      OUTPUT_FILE_BUFFER_FLUSH_INTERVAL: 10s
+      OUTPUT_FILE_BUFFER_CHUNK_LIMIT_SIZE: 100MB
+      OUTPUT_FILE_BUFFER_FLUSH_THREAD_COUNT: 2
+      OUTPUT_FILE_BUFFER_RETRY_FOREVER: true
+      OUTPUT_FILE_BUFFER_PATH: "/data/file-buffers/buffer.*"
+      OUTPUT_FILE_BUFFER_TOTAL_LIMIT_SIZE: 50GB
+      OUTPUT_FILE_BUFFER_COMPRESS: gzip
+      OUTPUT_FILE_BUFFER_FLUSH_MODE: interval
+      OUTPUT_FILE_BUFFER_RETRY_TYPE: exponential_backoff
+      OUTPUT_FILE_BUFFER_RETRY_MAX_INTERVAL: 30
+      OUTPUT_FILE_BUFFER_OVERFLOW_ACTION: block
+    secret:
+      OUTPUT_ELASTICSEARCH_PASSWORD: notdefined
+
+  configmaps:
+    fluentd-elasticsearch:
+      /fluentd/etc:
+        fluent.conf:
+          contents: |-
+            <system>
+              <log>
+                format json
+              </log>
+            </system>
+            <source>
+              @type forward
+              port "#{ENV['SOURCE_PORT']}"
+              bind "#{ENV['SOURCE_BIND']}"
+              @label @NORMAL
+            </source>
+            <label @FLUENT_LOG>
+              <match fluent.*>
+                @type stdout
+              </match>
+            </label>
+            <label @NORMAL>
+              <match *.**>
+                @type copy
+                copy_mode "#{ENV['OUTPUT_COPY_MODE']}"
+                <store>
+                  @type elasticsearch
+                  suppress_type_name "#{ENV['OUTPUT_ELASTICSEARCH_SUPPRESS_TYPE_NAME']}"
+                  host "#{ENV['OUTPUT_ELASTICSEARCH_HOST']}"
+                  port "#{ENV['OUTPUT_ELASTICSEARCH_PORT']}"
+                  user "#{ENV['OUTPUT_ELASTICSEARCH_USER']}"
+                  password "#{ENV['OUTPUT_ELASTICSEARCH_PASSWORD']}"
+                  scheme "#{ENV['OUTPUT_ELASTICSEARCH_SCHEME']}"
+                  include_tag_key "#{ENV['OUTPUT_ELASTICSEARCH_INCLUDE_TAG_KEY']}"
+                  tag_key "#{ENV['OUTPUT_ELASTICSEARCH_TAG_KEY']}"
+                  logstash_format "#{ENV['OUTPUT_ELASTICSEARCH_LOGSTASH_FORMAT']}"
+                  logstash_prefix "#{ENV['OUTPUT_ELASTICSEARCH_LOGSTASH_PREFIX']}"
+                  logstash_dateformat "#{ENV['OUTPUT_ELASTICSEARCH_LOGSTASH_DATEFORMAT']}"
+                  logstash_prefix_separator "#{ENV['OUTPUT_ELASTICSEARCH_LOGSTASH_PREFIX_SEPARATOR']}"
+                  request_timeout "#{ENV['OUTPUT_ELASTICSEARCH_REQUEST_TIMEOUT']}"
+                  reload_connections "#{ENV['OUTPUT_ELASTICSEARCH_RELOAD_CONNECTIONS']}"
+                  reconnect_on_error "#{ENV['OUTPUT_ELASTICSEARCH_RECONNECT_ON_ERROR']}"
+                  reload_on_failure "#{ENV['OUTPUT_ELASTICSEARCH_RELOAD_ON_FAILURE']}"
+                  log_es_400_reason "#{ENV['OUTPUT_ELASTICSEARCH_LOG_400_REASON']}"
+                  bulk_message_request_threshold "#{ENV['OUTPUT_ELASTICSEARCH_BULK_MESSAGE_REQUEST_THRESHOLD']}"
+                  ssl_verify "#{ENV['OUTPUT_ELASTICSEARCH_SSL_VERIFY']}"
+                  ssl_version "#{ENV['OUTPUT_ELASTICSEARCH_SSL_VERSION']}"
+                  type_name "#{ENV['OUTPUT_ELASTICSEARCH_TYPE_NAME']}"
+                  @log_level "#{ENV['OUTPUT_ELASTICSEARCH_LOG_LEVEL']}"
+                  sniffer_class_name "#{ENV['OUTPUT_ELASTICSEARCH_SNIFFER_CLASS_NAME']}"
+                  with_transporter_log "#{ENV['OUTPUT_ELASTICSEARCH_WITH_TRANSPORTER_LOG']}"
+                  include_index_in_url "#{ENV['OUTPUT_ELASTICSEARCH_INCLUDE_INDEX_IN_URL']}"
+                  <buffer>
+                    @type file
+                    flush_interval "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_FLUSH_INTERVAL']}"
+                    chunk_limit_size "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_CHUNK_LIMIT_SIZE']}"
+                    flush_thread_count "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_FLUSH_THREAD_COUNT']}"
+                    retry_forever "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_RETRY_FOREVER']}"
+                    path "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_PATH']}"
+                    total_limit_size "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_TOTAL_LIMIT_SIZE']}"
+                    compress "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_COMPRESS']}"
+                    flush_mode "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_FLUSH_MODE']}"
+                    retry_type "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_RETRY_TYPE']}"
+                    retry_max_interval "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_RETRY_MAX_INTERVAL']}"
+                    overflow_action "#{ENV['OUTPUT_ELASTICSEARCH_BUFFER_OVERFLOW_ACTION']}"
+                  </buffer>
+                </store>
+                <store"#{ENV['OUTPUT_FILE_ARGS'].nil? || ENV['OUTPUT_FILE_ARGS'].empty? ? "" : " " + ENV['OUTPUT_FILE_ARGS']}">
+                  @type file
+                  path "#{ENV['OUTPUT_FILE_PATH']}"
+                  append "#{ENV['OUTPUT_FILE_APPEND']}"
+                  add_path_suffix "#{ENV['OUTPUT_FILE_ADD_PATH_SUFFIX']}"
+                  path_suffix "#{ENV['OUTPUT_FILE_PATH_SUFFIX']}"
+                  compress "#{ENV['OUTPUT_FILE_COMPRESS']}"
+                  include_tag_key "#{ENV['OUTPUT_FILE_INCLUDE_TAG_KEY']}"
+                  tag_key "#{ENV['OUTPUT_FILE_TAG_KEY']}"
+                  <format>
+                    @type json
+                  </format>
+                  <buffer>
+                    @type file
+                    flush_interval "#{ENV['OUTPUT_FILE_BUFFER_FLUSH_INTERVAL']}"
+                    chunk_limit_size "#{ENV['OUTPUT_FILE_BUFFER_CHUNK_LIMIT_SIZE']}"
+                    flush_thread_count "#{ENV['OUTPUT_FILE_BUFFER_FLUSH_THREAD_COUNT']}"
+                    retry_forever "#{ENV['OUTPUT_FILE_BUFFER_RETRY_FOREVER']}"
+                    path "#{ENV['OUTPUT_FILE_BUFFER_PATH']}"
+                    total_limit_size "#{ENV['OUTPUT_FILE_BUFFER_TOTAL_LIMIT_SIZE']}"
+                    compress "#{ENV['OUTPUT_FILE_BUFFER_COMPRESS']}"
+                    flush_mode "#{ENV['OUTPUT_FILE_BUFFER_FLUSH_MODE']}"
+                    retry_type "#{ENV['OUTPUT_FILE_BUFFER_RETRY_TYPE']}"
+                    retry_max_interval "#{ENV['OUTPUT_FILE_BUFFER_RETRY_MAX_INTERVAL']}"
+                    overflow_action "#{ENV['OUTPUT_FILE_BUFFER_OVERFLOW_ACTION']}"
+                  </buffer>
+                </store>
+              </match>
+            </label>
+
+elastic-phenix-operator:
+  enabled: false
+  resources:
+    - apiVersion: v1
+      kind: Namespace
+      metadata:
+        labels:
+          control-plane: controller-manager
+        name: elastic-phenix-operator-system
+    - apiVersion: apiextensions.k8s.io/v1beta1
+      kind: CustomResourceDefinition
+      metadata:
+        annotations:
+          cert-manager.io/inject-ca-from: elastic-phenix-operator-system/elastic-phenix-operator-serving-cert
+          controller-gen.kubebuilder.io/version: v0.2.5
+        creationTimestamp: null
+        name: elasticindices.elastic.carrefour.com
+      spec:
+        additionalPrinterColumns:
+        - JSONPath: .spec.indexName
+          name: INDEX_NAME
+          type: string
+        - JSONPath: .spec.numberOfShards
+          name: SHARDS
+          type: integer
+        - JSONPath: .spec.numberOfReplicas
+          name: REPLICAS
+          type: integer
+        - JSONPath: .status.status
+          name: STATUS
+          type: string
+        - JSONPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+        conversion:
+          strategy: Webhook
+          webhookClientConfig:
+            caBundle: Cg==
+            service:
+              name: elastic-phenix-operator-webhook-service
+              namespace: elastic-phenix-operator-system
+              path: /convert
+        group: elastic.carrefour.com
+        names:
+          kind: ElasticIndex
+          listKind: ElasticIndexList
+          plural: elasticindices
+          shortNames:
+          - ei
+          singular: elasticindex
+        preserveUnknownFields: false
+        scope: Namespaced
+        subresources:
+          status: {}
+        validation:
+          openAPIV3Schema:
+            description: ElasticIndex is the Schema for the elasticindices API
+            properties:
+            - apiVersion:
+                description: 'APIVersion defines the versioned schema of this representation
+                  of an object. Servers should convert recognized schemas to the latest
+                  internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+                type: string
+              kind:
+                description: 'Kind is a string value representing the REST resource this
+                  object represents. Servers may infer this from the endpoint the client
+                  submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+                type: string
+              metadata:
+                type: object
+              spec:
+                description: ElasticIndexSpec defines the desired state of ElasticIndex
+                properties:
+                  elasticURI:
+                    description: Elasticsearch URI with this format <scheme>://<user>:<password>@<hostname>:<port>
+                      from a key of a secret in the local namespace
+                    properties:
+                      secretKeyRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must be
+                              a valid secret key.
+                            type: string
+                          name:
+                            description: 'Name of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              TODO: Add other useful fields. apiVersion, kind, uid?'
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                    required:
+                    - secretKeyRef
+                    type: object
+                  indexName:
+                    pattern: ^[a-z0-9-_\.]+$
+                    type: string
+                  model:
+                    type: string
+                  numberOfReplicas:
+                    format: int32
+                    maximum: 3
+                    minimum: 1
+                    type: integer
+                  numberOfShards:
+                    format: int32
+                    maximum: 500
+                    minimum: 1
+                    type: integer
+                required:
+                - elasticURI
+                - indexName
+                - model
+                - numberOfReplicas
+                - numberOfShards
+                type: object
+              status:
+                description: ElasticIndexStatus defines the observed state of ElasticIndex
+                properties:
+                  httpCodeStatus:
+                    type: string
+                  message:
+                    type: string
+                  status:
+                    type: string
+                type: object
+            type: object
+        version: v1alpha1
+        versions:
+        - name: v1alpha1
+          served: true
+          storage: true
+      status:
+        acceptedNames:
+          kind: ""
+          plural: ""
+        conditions: []
+        storedVersions: []
+    - apiVersion: apiextensions.k8s.io/v1beta1
+      kind: CustomResourceDefinition
+      metadata:
+        annotations:
+          cert-manager.io/inject-ca-from: elastic-phenix-operator-system/elastic-phenix-operator-serving-cert
+          controller-gen.kubebuilder.io/version: v0.2.5
+        creationTimestamp: null
+        name: elastictemplates.elastic.carrefour.com
+      spec:
+        additionalPrinterColumns:
+        - JSONPath: .spec.templateName
+          name: TEMPLATE_NAME
+          type: string
+        - JSONPath: .spec.numberOfShards
+          name: SHARDS
+          type: integer
+        - JSONPath: .spec.numberOfReplicas
+          name: REPLICAS
+          type: integer
+        - JSONPath: .status.status
+          name: STATUS
+          type: string
+        - JSONPath: .metadata.creationTimestamp
+          name: AGE
+          type: date
+        conversion:
+          strategy: Webhook
+          webhookClientConfig:
+            caBundle: Cg==
+            service:
+              name: elastic-phenix-operator-webhook-service
+              namespace: elastic-phenix-operator-system
+              path: /convert
+        group: elastic.carrefour.com
+        names:
+          kind: ElasticTemplate
+          listKind: ElasticTemplateList
+          plural: elastictemplates
+          shortNames:
+          - et
+          singular: elastictemplate
+        preserveUnknownFields: false
+        scope: Namespaced
+        subresources:
+          status: {}
+        validation:
+          openAPIV3Schema:
+            description: ElasticTemplate is the Schema for the elastictemplates API
+            properties:
+            - apiVersion:
+                description: 'APIVersion defines the versioned schema of this representation
+                  of an object. Servers should convert recognized schemas to the latest
+                  internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+                type: string
+              kind:
+                description: 'Kind is a string value representing the REST resource this
+                  object represents. Servers may infer this from the endpoint the client
+                  submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+                type: string
+              metadata:
+                type: object
+              spec:
+                description: ElasticTemplateSpec defines the desired state of ElasticTemplate
+                properties:
+                  elasticURI:
+                    description: Elasticsearch URI with this format <scheme>://<user>:<password>@<hostname>:<port>
+                      from a key of a secret in the local namespace
+                    properties:
+                      secretKeyRef:
+                        description: SecretKeySelector selects a key of a Secret.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must be
+                              a valid secret key.
+                            type: string
+                          name:
+                            description: 'Name of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              TODO: Add other useful fields. apiVersion, kind, uid?'
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                    required:
+                    - secretKeyRef
+                    type: object
+                  model:
+                    type: string
+                  numberOfReplicas:
+                    format: int32
+                    maximum: 3
+                    minimum: 1
+                    type: integer
+                  numberOfShards:
+                    format: int32
+                    maximum: 500
+                    minimum: 1
+                    type: integer
+                  order:
+                    nullable: true
+                    type: integer
+                  templateName:
+                    pattern: ^[a-z0-9-_\.]+$
+                    type: string
+                required:
+                - elasticURI
+                - model
+                - numberOfReplicas
+                - numberOfShards
+                - templateName
+                type: object
+              status:
+                description: ElasticTemplateStatus defines the observed state of ElasticTemplate
+                properties:
+                  httpCodeStatus:
+                    type: string
+                  message:
+                    type: string
+                  status:
+                    type: string
+                type: object
+            type: object
+        version: v1alpha1
+        versions:
+        - name: v1alpha1
+          served: true
+          storage: true
+      status:
+        acceptedNames:
+          kind: ""
+          plural: ""
+        conditions: []
+        storedVersions: []
+    - apiVersion: admissionregistration.k8s.io/v1beta1
+      kind: MutatingWebhookConfiguration
+      metadata:
+        annotations:
+          cert-manager.io/inject-ca-from: elastic-phenix-operator-system/elastic-phenix-operator-serving-cert
+        creationTimestamp: null
+        name: elastic-phenix-operator-mutating-webhook-configuration
+      webhooks:
+      - clientConfig:
+          caBundle: Cg==
+          service:
+            name: elastic-phenix-operator-webhook-service
+            namespace: elastic-phenix-operator-system
+            path: /mutate-elastic-carrefour-com-v1alpha1-elasticindex
+        failurePolicy: Fail
+        name: melasticindex.kb.io
+        rules:
+        - apiGroups:
+          - elastic.carrefour.com
+          apiVersions:
+          - v1alpha1
+          operations:
+          - CREATE
+          - UPDATE
+          resources:
+          - elasticindices
+        sideEffects: None
+      - clientConfig:
+          caBundle: Cg==
+          service:
+            name: elastic-phenix-operator-webhook-service
+            namespace: elastic-phenix-operator-system
+            path: /mutate-elastic-carrefour-com-v1alpha1-elastictemplate
+        failurePolicy: Fail
+        name: melastictemplate.kb.io
+        rules:
+        - apiGroups:
+          - elastic.carrefour.com
+          apiVersions:
+          - v1alpha1
+          operations:
+          - CREATE
+          - UPDATE
+          resources:
+          - elastictemplates
+        sideEffects: None
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: elastic-phenix-operator-leader-election-role
+        namespace: elastic-phenix-operator-system
+      rules:
+      - apiGroups:
+        - ""
+        resources:
+        - configmaps
+        verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+        - delete
+      - apiGroups:
+        - ""
+        resources:
+        - configmaps/status
+        verbs:
+        - get
+        - update
+        - patch
+      - apiGroups:
+        - ""
+        resources:
+        - events
+        verbs:
+        - create
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        creationTimestamp: null
+        name: elastic-phenix-operator-manager-role
+      rules:
+      - apiGroups:
+        - ""
+        resources:
+        - configmaps
+        verbs:
+        - get
+        - list
+        - watch
+      - apiGroups:
+        - ""
+        resources:
+        - secrets
+        verbs:
+        - get
+        - list
+        - watch
+      - apiGroups:
+        - elastic.carrefour.com
+        resources:
+        - elasticindices
+        verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+      - apiGroups:
+        - elastic.carrefour.com
+        resources:
+        - elasticindices/finalizers
+        verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+      - apiGroups:
+        - elastic.carrefour.com
+        resources:
+        - elasticindices/status
+        verbs:
+        - get
+        - patch
+        - update
+      - apiGroups:
+        - elastic.carrefour.com
+        resources:
+        - elastictemplates
+        verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+      - apiGroups:
+        - elastic.carrefour.com
+        resources:
+        - elastictemplates/finalizers
+        verbs:
+        - create
+        - delete
+        - get
+        - list
+        - patch
+        - update
+        - watch
+      - apiGroups:
+        - elastic.carrefour.com
+        resources:
+        - elastictemplates/status
+        verbs:
+        - get
+        - patch
+        - update
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: elastic-phenix-operator-proxy-role
+      rules:
+      - apiGroups:
+        - authentication.k8s.io
+        resources:
+        - tokenreviews
+        verbs:
+        - create
+      - apiGroups:
+        - authorization.k8s.io
+        resources:
+        - subjectaccessreviews
+        verbs:
+        - create
+    - apiVersion: rbac.authorization.k8s.io/v1beta1
+      kind: ClusterRole
+      metadata:
+        name: elastic-phenix-operator-metrics-reader
+      rules:
+      - nonResourceURLs:
+        - /metrics
+        verbs:
+        - get
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: elastic-phenix-operator-leader-election-rolebinding
+        namespace: elastic-phenix-operator-system
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: elastic-phenix-operator-leader-election-role
+      subjects:
+      - kind: ServiceAccount
+        name: default
+        namespace: elastic-phenix-operator-system
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: elastic-phenix-operator-manager-rolebinding
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: elastic-phenix-operator-manager-role
+      subjects:
+      - kind: ServiceAccount
+        name: default
+        namespace: elastic-phenix-operator-system
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: elastic-phenix-operator-proxy-rolebinding
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: elastic-phenix-operator-proxy-role
+      subjects:
+      - kind: ServiceAccount
+        name: default
+        namespace: elastic-phenix-operator-system
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        labels:
+          control-plane: controller-manager
+        name: elastic-phenix-operator-controller-manager-metrics-service
+        namespace: elastic-phenix-operator-system
+      spec:
+        ports:
+        - name: https
+          port: 8443
+          targetPort: https
+        selector:
+          control-plane: controller-manager
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: elastic-phenix-operator-webhook-service
+        namespace: elastic-phenix-operator-system
+      spec:
+        ports:
+        - port: 443
+          targetPort: 9443
+        selector:
+          control-plane: controller-manager
+    - apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        labels:
+          control-plane: controller-manager
+        name: elastic-phenix-operator-controller-manager
+        namespace: elastic-phenix-operator-system
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            control-plane: controller-manager
+        template:
+          metadata:
+            labels:
+              control-plane: controller-manager
+          spec:
+            containers:
+            - args:
+              - --secure-listen-address=0.0.0.0:8443
+              - --upstream=http://127.0.0.1:8080/
+              - --logtostderr=true
+              - --v=10
+              image: gcr.io/kubebuilder/kube-rbac-proxy:v0.5.0
+              name: kube-rbac-proxy
+              ports:
+              - containerPort: 8443
+                name: https
+            - args:
+              - --metrics-addr=127.0.0.1:8080
+              - --enable-leader-election
+              command:
+              - /manager
+              image: carrefourphx/elastic-phenix-operator:0.1.0
+              name: manager
+              ports:
+              - containerPort: 9443
+                name: webhook-server
+                protocol: TCP
+              resources:
+                limits:
+                  cpu: 100m
+                  memory: 30Mi
+                requests:
+                  cpu: 100m
+                  memory: 20Mi
+              volumeMounts:
+              - mountPath: /tmp/k8s-webhook-server/serving-certs
+                name: cert
+                readOnly: true
+            terminationGracePeriodSeconds: 10
+            volumes:
+            - name: cert
+              secret:
+                defaultMode: 420
+                secretName: webhook-server-cert
+    - apiVersion: cert-manager.io/v1alpha2
+      kind: Certificate
+      metadata:
+        name: elastic-phenix-operator-serving-cert
+        namespace: elastic-phenix-operator-system
+      spec:
+        dnsNames:
+        - elastic-phenix-operator-webhook-service.elastic-phenix-operator-system.svc
+        - elastic-phenix-operator-webhook-service.elastic-phenix-operator-system.svc.cluster.local
+        issuerRef:
+          kind: Issuer
+          name: elastic-phenix-operator-selfsigned-issuer
+        secretName: webhook-server-cert
+    - apiVersion: cert-manager.io/v1alpha2
+      kind: Issuer
+      metadata:
+        name: elastic-phenix-operator-selfsigned-issuer
+        namespace: elastic-phenix-operator-system
+      spec:
+        selfSigned: {}
+    - apiVersion: admissionregistration.k8s.io/v1beta1
+      kind: ValidatingWebhookConfiguration
+      metadata:
+        annotations:
+          cert-manager.io/inject-ca-from: elastic-phenix-operator-system/elastic-phenix-operator-serving-cert
+        creationTimestamp: null
+        name: elastic-phenix-operator-validating-webhook-configuration
+      webhooks:
+      - clientConfig:
+          caBundle: Cg==
+          service:
+            name: elastic-phenix-operator-webhook-service
+            namespace: elastic-phenix-operator-system
+            path: /validate-elastic-carrefour-com-v1alpha1-elasticindex
+        failurePolicy: Fail
+        name: velasticindex.kb.io
+        rules:
+        - apiGroups:
+          - elastic.carrefour.com
+          apiVersions:
+          - v1alpha1
+          operations:
+          - CREATE
+          - UPDATE
+          - DELETE
+          resources:
+          - elasticindices
+        sideEffects: None
+      - clientConfig:
+          caBundle: Cg==
+          service:
+            name: elastic-phenix-operator-webhook-service
+            namespace: elastic-phenix-operator-system
+            path: /validate-elastic-carrefour-com-v1alpha1-elastictemplate
+        failurePolicy: Fail
+        name: velastictemplate.kb.io
+        rules:
+        - apiGroups:
+          - elastic.carrefour.com
+          apiVersions:
+          - v1alpha1
+          operations:
+          - CREATE
+          - UPDATE
+          - DELETE
+          resources:
+          - elastictemplates
+        sideEffects: None
+
+kibana-sidecar:
+  enabled: false
+  fullnameOverride: kibana-sidecar
+  replicaCount: 1
+
+  image:
+    repository: inmoment/kibana-sidecar
+    tag: 20200514.145430-500b058
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 15m
+      memory: 100Mi
+    limits:
+      cpu: 15m
+      memory: 100Mi
+
+  service:
+    ports: []
+    enabled: false
+
+  env:
+    open:
+      KIBANA_BASE_URL: notdefined
+      ELASTICSEARCH_BASE_URL: notdefined
+      LOGLEVEL: INFO
+      LABEL: kibana_object
+    secret:
+      KIBANA_USERNAME: notdefined
+      KIBANA_PASSWORD: notdefined
+
+  livenessProbe:
+    enabled: false
+
+  readinessProbe:
+    enabled: false
+
+  rbac:
+    clusterRole:
+      fullnameOverride: kibana-sidecar-cluster-role
+      create: true
+      spec:
+        rules:
+        - apiGroups: [""]
+          resources: ["configmaps"]
+          verbs: ["get", "watch", "list"]
+    clusterRoleBinding:
+      create: true
+      fullnameOverride: kibana-sidecar-cluster-role-binding
+      spec:
+        roleRef:
+          kind: ClusterRole
+          name: kibana-sidecar-cluster-role
+          apiGroup: rbac.authorization.k8s.io
+        subjects:
+        - kind: ServiceAccount
+          name: kibana-sidecar
+          namespace: k8s-log-ingestion
+
+  serviceAccount:
+    create: true

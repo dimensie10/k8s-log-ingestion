@@ -1,0 +1,15 @@
+dependencies:
+- name: raw
+  repository: https://charts.helm.sh/incubator/
+  version: 0.2.5
+- name: generic-helm-chart
+  repository: https://dimensie10.github.io/generic-helm-chart
+  version: 2.4.0
+- name: generic-helm-chart
+  repository: https://dimensie10.github.io/generic-helm-chart
+  version: 2.4.0
+- name: generic-helm-chart
+  repository: https://dimensie10.github.io/generic-helm-chart
+  version: 2.4.0
+digest: sha256:c318a615d6c73031e3f787c74884e0f7bfc39f7f2bd1de647283d7b34f59767b
+generated: "2022-05-31T14:59:27.770211+02:00"
