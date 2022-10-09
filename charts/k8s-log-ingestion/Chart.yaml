@@ -3,7 +3,7 @@ appVersion: 0.1.0
 description: A Helm chart for deploying a k8s log ingestion system on Kubernetes
 name: k8s-log-ingestion
 type: application
-version: 1.0.0
+version: 1.0.1
 dependencies:
   - name: raw
     condition: elastic-phenix-operator.enabled
